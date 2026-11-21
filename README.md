@@ -1,5 +1,16 @@
 # Agent Proxy
 
+> [!WARNING]
+> **Experimental project. Use at your own risk.**
+>
+> The gateway runs on your machine, but any MCP or ACP client that holds the API key gets
+> effectively unrestricted access to every agent CLI configured on this host. Through those
+> agents, a client can read and edit files, run shell commands and use the agents' own
+> credentials, with the same permissions as the user running the gateway. The workspace
+> allowlist is not a sandbox (see [Security model](#security-model)). Only connect clients
+> you fully trust, keep the API key secret, and prefer running it in an isolated container
+> or VM.
+
 One HTTP endpoint that exposes four local coding agents to remote MCP and ACP clients (for example Nod):
 
 - **Claude Code** (`claude`): headless `claude -p`, plus its native tools proxied from `claude mcp serve`
