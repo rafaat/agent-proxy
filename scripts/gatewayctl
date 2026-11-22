@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Manage the gateway as a macOS launchd LaunchAgent (starts at login, restarts on crash).
+set -euo pipefail
+
+LABEL="${GATEWAY_LAUNCHD_LABEL:-com.agent-proxy.gateway}"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+LOG_DIR="$HOME/Library/Logs/agent-proxy"
+DOMAIN="gui/$(id -u)"
+TARGET="$DOMAIN/$LABEL"
+
+xml_escape() {
+  local s="$1"
+  s="${s//&/&amp;}"; s="${s//</&lt;}"; s="${s//>/&gt;}"
+  printf '%s' "$s"
+}
+
+is_loaded() { launchctl print "$TARGET" >/dev/null 2>&1; }
+
+# bootout returns before the job is fully removed; wait so a following bootstrap doesn't race it.
+wait_unloaded() {
+  local i
+  for i in {1..50}; do is_loaded || return 0; sleep 0.2; done
+  echo "warning: $LABEL still unloading" >&2
+}
+
+require_installed() {
+  [[ -f "$PLIST" ]] || { echo "Not installed. Run: $0 install" >&2; exit 1; }
+}
+
+cmd_install() {
+  local uv_bin
+  uv_bin="$(command -v uv)" || { echo "uv not found on PATH" >&2; exit 1; }
+  [[ -f "$REPO_DIR/.env" ]] || echo "warning: $REPO_DIR/.env not found; the gateway reads it from the repo dir" >&2
+  mkdir -p "$LOG_DIR" "$(dirname "$PLIST")"
+  # launchd starts with a minimal PATH, so capture the current one to find claude/copilot/codex/opencode.
+  cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$(xml_escape "$LABEL")</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$(xml_escape "$uv_bin")</string>
+    <string>run</string>
+    <string>--no-sync</string>
+    <string>python</string>
+    <string>-m</string>
+    <string>gateway</string>
+  </array>
+  <key>WorkingDirectory</key><string>$(xml_escape "$REPO_DIR")</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>$(xml_escape "$PATH")</string>
+    <key>HOME</key><string>$(xml_escape "$HOME")</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>ThrottleInterval</key><integer>10</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>$(xml_escape "$LOG_DIR/gateway.out.log")</string>
+  <key>StandardErrorPath</key><string>$(xml_escape "$LOG_DIR/gateway.err.log")</string>
+</dict>
+</plist>
+EOF
+  plutil -lint "$PLIST" >/dev/null
+  if is_loaded; then launchctl bootout "$TARGET" 2>/dev/null || true; fi
+  wait_unloaded
+  launchctl enable "$TARGET"
+  launchctl bootstrap "$DOMAIN" "$PLIST"
+  echo "Installed $PLIST (auto-starts at login). Logs: $LOG_DIR"
+}
+
+cmd_uninstall() {
+  if is_loaded; then launchctl bootout "$TARGET" || true; fi
+  wait_unloaded
+  rm -f "$PLIST"
+  echo "Uninstalled $LABEL"
+}
+
+cmd_start() {
+  require_installed
+  if is_loaded; then
+    launchctl kickstart "$TARGET"
+  else
+    launchctl enable "$TARGET"
+    launchctl bootstrap "$DOMAIN" "$PLIST"
+  fi
+  echo "Started $LABEL"
+}
+
+cmd_stop() {
+  require_installed
+  # bootout so KeepAlive doesn't respawn it; it comes back at next login or `start`.
+  if is_loaded; then launchctl bootout "$TARGET" || true; fi
+  wait_unloaded
+  echo "Stopped $LABEL"
+}
+
+cmd_restart() {
+  require_installed
+  if is_loaded; then
+    launchctl kickstart -k "$TARGET"
+    echo "Restarted $LABEL"
+  else
+    cmd_start
+  fi
+}
+
+cmd_status() {
+  if [[ ! -f "$PLIST" ]]; then echo "$LABEL: not installed"; exit 3; fi
+  if ! is_loaded; then echo "$LABEL: stopped (not loaded)"; exit 3; fi
+  local info pid state
+  info="$(launchctl print "$TARGET")"
+  state="$(awk -F'= ' '/^\tstate = /{print $2; exit}' <<<"$info")"
+  pid="$(awk -F'= ' '/^\tpid = /{print $2; exit}' <<<"$info")"
+  echo "$LABEL: ${state:-unknown}${pid:+ (pid $pid)}"
+  awk '/^\tlast exit code = /{sub(/^\t/, ""); print; exit}' <<<"$info"
+  [[ "$state" == "running" ]] || exit 3
+}
+
+cmd_logs() {
+  tail -n 50 -F "$LOG_DIR/gateway.err.log" "$LOG_DIR/gateway.out.log"
+}
+
+case "${1:-}" in
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  start) cmd_start ;;
+  stop) cmd_stop ;;
+  restart) cmd_restart ;;
+  status) cmd_status ;;
+  logs) cmd_logs ;;
+  *) echo "Usage: $0 {install|uninstall|start|stop|restart|status|logs}" >&2; exit 2 ;;
+esac

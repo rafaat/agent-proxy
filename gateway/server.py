@@ -41,7 +41,6 @@ logger = logging.getLogger("gateway.server")
 PROTECTED_PREFIXES = ("/mcp", "/sse", "/messages", "/agents", "/acp")
 _HEARTBEAT_SECONDS = 15.0
 _STDERR_TAIL_CHARS = 4000
-_APPROVAL_TIMEOUT_SECONDS = 60.0
 _MAX_FOLLOWUP_TURNS = 16
 
 PromptArg = Annotated[str, Field(description="Task or question for the agent.")]
@@ -63,6 +62,15 @@ SessionIdArg = Annotated[
     ),
 ]
 LimitArg = Annotated[int, Field(description="Maximum sessions to return (1-200).", ge=1, le=200)]
+AskAgentArg = Annotated[
+    bool | Literal["auto", "never"],
+    Field(
+        description=(
+            "true/'auto' (default): allow one billable model turn, only for tool or skill categories the CLI "
+            "verifiably cannot list natively. false/'never': listing only, no model is ever called."
+        )
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -176,23 +184,27 @@ def _supports_form_elicitation(ctx: Context[Any, Any]) -> bool:
     return elicitation is not None and (elicitation.form is not None or elicitation.url is None)
 
 
-def _approval_message(agent: AgentName, title: str, paths: tuple[Path, ...]) -> str | None:
+def _approval_message(
+    agent: AgentName, title: str, paths: tuple[Path, ...], outside: tuple[Path, ...] = ()
+) -> str | None:
     message = f"{agent.value} requests permission: {title}"
     if paths:
         message += "\nReported paths:\n" + "\n".join(str(path) for path in paths)
+    if outside:
+        message += "\nWARNING: outside the allowed workspaces:\n" + "\n".join(str(path) for path in outside)
     if len(message) > 4000:
         logger.warning("interactive_approval_details_too_long", extra={"agent": agent.value})
         return None
     return message
 
 
-def _interactive_approval(ctx: Context[Any, Any], agent: AgentName) -> PermissionApproval:
-    async def approve(_session_id: str, title: str, paths: tuple[Path, ...]) -> bool:
-        message = _approval_message(agent, title, paths)
+def _interactive_approval(ctx: Context[Any, Any], agent: AgentName, timeout_seconds: float) -> PermissionApproval:
+    async def approve(_session_id: str, title: str, paths: tuple[Path, ...], outside: tuple[Path, ...]) -> bool:
+        message = _approval_message(agent, title, paths, outside)
         if message is None:
             return False
         try:
-            async with asyncio.timeout(_APPROVAL_TIMEOUT_SECONDS):
+            async with asyncio.timeout(timeout_seconds):
                 result = await ctx.elicit(message, PermissionForm)
         except (TimeoutError, MCPError, ValidationError) as exc:
             logger.warning("interactive_approval_failed", extra={"agent": agent.value, "reason": type(exc).__name__})
@@ -241,9 +253,10 @@ class FollowupApprovals:
         if len(self._tasks) >= _MAX_FOLLOWUP_TURNS:
             raise ToolError("Too many interactive turns are in progress. Try again shortly.")
         loop = asyncio.get_running_loop()
+        timeout_seconds = registry.settings.interactive_approval_timeout_seconds
 
-        async def approve(active_session: str, title: str, paths: tuple[Path, ...]) -> bool:
-            message = _approval_message(agent, title, paths)
+        async def approve(active_session: str, title: str, paths: tuple[Path, ...], outside: tuple[Path, ...]) -> bool:
+            message = _approval_message(agent, title, paths, outside)
             if message is None:
                 return False
             approval_id = secrets.token_urlsafe(24)
@@ -276,13 +289,13 @@ class FollowupApprovals:
                             "session_id": active_session,
                             "approval": {"approval_id": approval_id},
                         },
-                        "expires_in_seconds": _APPROVAL_TIMEOUT_SECONDS,
+                        "expires_in_seconds": timeout_seconds,
                         "instructions": instructions,
                     },
                 )
             )
             try:
-                async with asyncio.timeout(_APPROVAL_TIMEOUT_SECONDS):
+                async with asyncio.timeout(timeout_seconds):
                     return await decision
             except TimeoutError:
                 logger.info("interactive_followup_expired", extra={"agent": agent.value})
@@ -392,7 +405,9 @@ def _add_agent_tool(
                 model,
                 session_id,
                 ctx,
-                approve_permission=_interactive_approval(ctx, agent),
+                approve_permission=_interactive_approval(
+                    ctx, agent, registry.settings.interactive_approval_timeout_seconds
+                ),
             )
 
         server.add_tool(
@@ -445,6 +460,49 @@ def _add_sessions_tool(server: MCPServer, registry: AgentRegistry, fixed_agent: 
     server.add_tool(list_sessions, description=description, structured_output=False)
 
 
+def _add_capabilities_tool(server: MCPServer, registry: AgentRegistry, fixed_agent: AgentName | None) -> None:
+    description = (
+        "Report an agent's tools and skills in working_dir from the CLI's own model-free metadata commands. "
+        "`coverage` marks each category native (authoritative, empty is valid), unavailable (probe failed, "
+        "no model fallback), unknown (no verified listing was run) or unsupported (CLI has no listing). Only "
+        "unsupported categories, and only when ask_agent is true (default), trigger one model turn (self_report). "
+        "ask_agent=false never calls a model. "
+        "Use allow_rule values for <AGENT>_ALLOWED_TOOLS."
+    )
+    if fixed_agent:
+
+        async def list_agent_capabilities(
+            working_dir: WorkingDirArg = None, ask_agent: AskAgentArg = True, model: ModelArg = None
+        ) -> str:
+            return await _capabilities_json(registry, fixed_agent, working_dir, ask_agent, model)
+
+    else:
+
+        async def list_agent_capabilities(  # type: ignore[misc]
+            agent: Annotated[AgentName, Field(description="Agent to inspect.")],
+            working_dir: WorkingDirArg = None,
+            ask_agent: AskAgentArg = True,
+            model: ModelArg = None,
+        ) -> str:
+            return await _capabilities_json(registry, agent, working_dir, ask_agent, model)
+
+    server.add_tool(list_agent_capabilities, description=description, structured_output=False)
+
+
+async def _capabilities_json(
+    registry: AgentRegistry,
+    agent: AgentName,
+    working_dir: str | None,
+    ask_agent: bool | Literal["auto", "never"],
+    model: str | None,
+) -> str:
+    try:
+        report = await registry.capabilities(agent, working_dir, ask_agent=ask_agent, model=model)
+    except (InputError, WorkspaceError, AgentUnavailableError) as exc:
+        raise ToolError(str(exc)) from exc
+    return json.dumps(report, indent=2)
+
+
 async def _sessions_json(registry: AgentRegistry, agent: AgentName | None, working_dir: str | None, limit: int) -> str:
     try:
         sessions = await registry.list_sessions(agent, working_dir, limit)
@@ -490,6 +548,7 @@ def build_mcp_server(
         _add_agent_tool(server, registry, agent)
         _add_agent_tool(server, registry, agent, followups=followups)
     _add_sessions_tool(server, registry, agents[0] if len(agents) == 1 else None)
+    _add_capabilities_tool(server, registry, agents[0] if len(agents) == 1 else None)
     if include_discovery:
         _add_discovery_tool(server, registry)
     return server

@@ -40,6 +40,40 @@ if argv[:2] == ["login", "status"]:
     print("Not logged in"); sys.exit(1)
 if argv[:2] == ["session", "list"]:
     print(open(os.environ["FAKE_OPENCODE_SESSIONS"]).read()); sys.exit(0)
+if argv[:2] == ["-p", "/cost"]:
+    event = {"type": "system", "subtype": "init", "cwd": os.getcwd(), "memory_paths": {"auto": "/secret"},
+        "tools": ["Read", "mcp__plugin_slack_slack__slack_read_channel", "mcp__scout__search", "mcp__gone__x"],
+        "mcp_servers": [{"name": "plugin:slack:slack", "status": "connected", "source": "plugin"},
+                        {"name": "scout", "status": "pending", "source": "user"}],
+        "skills": ["git"], "agents": ["Explore"], "slash_commands": ["git"],
+        "plugins": [{"name": "slack", "path": "/p", "source": "slack@official"}]}
+    if "EMPTY" in argv:
+        event["tools"] = []
+        event["skills"] = []
+    if "NO_SERVERS" in argv:
+        event["mcp_servers"] = []
+    if "NO_TOOLS" in argv:
+        event.pop("tools")
+    if "NO_SKILLS" in argv:
+        event.pop("skills")
+    print(json.dumps(event))
+    print(json.dumps({"type": "result", "subtype": "success"})); sys.exit(0)
+if argv == ["mcp", "list", "--json"]:
+    print(json.dumps({"mcpServers": {"slack": {"type": "http", "source": "user", "tools": ["*"],
+        "headers": {"Authorization": "Bearer FAKE_SECRET"}, "env": {"TOKEN": "FAKE_SECRET"}}}})); sys.exit(0)
+if argv[:2] == ["skill", "list"] and len(argv) == 4:
+    # Stub variants for native-listing outcomes: empty, transient error, malformed.
+    if argv[3] == "EMPTY":
+        print("[]"); sys.exit(0)
+    if argv[3] == "ERROR":
+        print("boom SECRET_RAW"); sys.exit(3)
+    if argv[3] == "BAD":
+        print('{"not": "a list"}'); sys.exit(0)
+if argv == ["debug", "skill"]:
+    print(json.dumps([{"name": "oc", "description": "OC", "location": "/p", "content": "SECRET_BODY"}])); sys.exit(0)
+if argv == ["skill", "list", "--json"]:
+    print(json.dumps([{"name": "git", "description": "Git", "source": "inherited", "path": "/x", "enabled": True}]))
+    sys.exit(0)
 stdin = sys.stdin.read() if not sys.stdin.isatty() else ""
 text = " ".join(argv) + stdin
 if "SLEEP" in text:

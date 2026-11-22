@@ -16,7 +16,7 @@ import uuid
 from collections.abc import AsyncIterator, Hashable
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import anyio
 from mcp import types
@@ -24,6 +24,13 @@ from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
 from gateway.acp_client import AcpError, AcpStdioClient, PermissionApproval
+from gateway.capabilities import (
+    parse_claude_init,
+    parse_codex_mcp_list,
+    parse_copilot_mcp_list,
+    parse_copilot_skill_list,
+    parse_opencode_skill_list,
+)
 from gateway.config import (
     AgentConfig,
     AgentName,
@@ -48,7 +55,9 @@ from gateway.sessions import (
 
 logger = logging.getLogger("gateway.agents")
 
-_PLACEHOLDER = re.compile(r"\{(prompt|cwd|model|session_id)\}")
+_PLACEHOLDER = re.compile(r"\{(prompt|cwd|model|session_id|tool)\}")
+# Claude matches "*" only inside the tool part of mcp__<server>__<tool>, never in the server name.
+_CLAUDE_SERVER_GLOB = re.compile(r"^mcp__(?:(?!__).)*\*")
 _CHUNK = 64 * 1024
 _KILL_GRACE_SECONDS = 5.0
 _SCRUBBED_ENV = ("GATEWAY_API_KEY",)
@@ -103,14 +112,20 @@ class SessionTarget:
 
 
 def render_args(
-    template: str, *, prompt: str = "", cwd: Path | None = None, model: str = "", session_id: str = ""
+    template: str,
+    *,
+    prompt: str = "",
+    cwd: Path | None = None,
+    model: str = "",
+    session_id: str = "",
+    tool: str = "",
 ) -> tuple[list[str], bool]:
     """Expand a shlex template into argv. Returns (argv, prompt_was_used).
 
     Substitution happens after splitting and in a single pass, so prompt text
     always stays one argv element and can never inject flags or placeholders.
     """
-    values = {"prompt": prompt, "cwd": str(cwd or ""), "model": model, "session_id": session_id}
+    values = {"prompt": prompt, "cwd": str(cwd or ""), "model": model, "session_id": session_id, "tool": tool}
     used_prompt = False
     argv: list[str] = []
     for part in shlex.split(template):
@@ -140,6 +155,12 @@ def build_cli_command(
     if model:
         model_args, _ = render_args(cfg.model_args, model=model, cwd=cwd)
         args += model_args
+    for tool in cfg.allowed_tools:
+        tool_args, _ = render_args(cfg.allowed_tools_args, tool=tool, cwd=cwd)
+        args += tool_args
+    if cfg.allow_all_tools:
+        all_args, _ = render_args(cfg.allow_all_tools_args, cwd=cwd)
+        args += all_args
     stdin = None if used_prompt else prompt.encode()
     return [cfg.bin, *args], stdin
 
@@ -360,6 +381,43 @@ class AcpAdapter:
         self._workspace = workspace
         self._approve_permission = approve_permission
 
+    def _resolve_permission_path(self, raw: str, cwd: Path) -> tuple[Path, bool]:
+        try:
+            return self._workspace.resolve_path(raw, base=cwd), True
+        except WorkspaceError:
+            pass
+        if "\x00" in raw:
+            raise WorkspaceError("Path contains a NUL byte")
+        path = Path(raw).expanduser()
+        resolved = (path if path.is_absolute() else cwd / path).resolve()
+        extra = self._settings.acp_permission_roots()
+        return resolved, any(resolved.is_relative_to(root) for root in extra)
+
+    def _pausing_approval(self, holder: list[asyncio.Timeout]) -> PermissionApproval | None:
+        """Wrap the approval callback so time spent waiting on a human doesn't count toward the run timeout."""
+        inner = self._approve_permission
+        if inner is None:
+            return None
+        waiting = 0
+        remaining = 0.0
+
+        async def approve(session_id: str, title: str, paths: tuple[Path, ...], outside: tuple[Path, ...]) -> bool:
+            nonlocal waiting, remaining
+            loop = asyncio.get_running_loop()
+            deadline = holder[0] if holder else None
+            if deadline is not None and waiting == 0 and (when := deadline.when()) is not None:
+                remaining = max(when - loop.time(), 0.0)
+                deadline.reschedule(None)
+            waiting += 1
+            try:
+                return await inner(session_id, title, paths, outside)
+            finally:
+                waiting -= 1
+                if deadline is not None and waiting == 0:
+                    deadline.reschedule(loop.time() + remaining)
+
+        return approve
+
     async def run(self, prompt: str, cwd: Path, model: str | None, session: SessionTarget) -> AgentResult:
         args, _ = render_args(self.config.acp_args, cwd=cwd)
         started = time.monotonic()
@@ -371,18 +429,21 @@ class AcpAdapter:
         )
         stderr_task = asyncio.create_task(_read_capped(proc.stderr, 64 * 1024))
         timed_out, exit_code, error = False, 0, ""
+        deadline: list[asyncio.Timeout] = []
         client = AcpStdioClient(
             proc,
             permission_policy=self._settings.acp_permission_policy,
-            resolve_path=lambda path: self._workspace.resolve_path(path, base=cwd),
+            resolve_path=lambda path: self._resolve_permission_path(path, cwd),
             max_output_bytes=self._settings.max_output_bytes,
-            approve_permission=self._approve_permission,
+            approve_permission=self._pausing_approval(deadline),
+            prompt_outside_paths=self._settings.interactive_approve_outside_paths,
         )
         turn = None
         try:
             async with client:
                 try:
-                    async with asyncio.timeout(self._settings.subprocess_timeout_seconds):
+                    async with asyncio.timeout(self._settings.subprocess_timeout_seconds) as timeout:
+                        deadline.append(timeout)
                         turn = await client.run_turn(cwd, prompt, model, session.id if session.resume else None)
                 except TimeoutError:
                     timed_out, exit_code = True, None
@@ -573,6 +634,8 @@ def _error_result(message: str) -> types.CallToolResult:
 
 _DISCOVERY_TTL_SECONDS = 60.0
 _DISCOVERY_TIMEOUT_SECONDS = 20.0
+_CAPABILITIES_TIMEOUT_SECONDS = 60.0
+_CAPABILITIES_MAX_OUTPUT_BYTES = 4_000_000
 _MAX_SESSION_LIMIT = 200
 
 
@@ -635,8 +698,16 @@ class AgentRegistry:
 
     def _make_adapter(self, name: AgentName) -> AgentAdapter:
         cfg = self.settings.agent(name)
+        if name is AgentName.CLAUDE:
+            for rule in cfg.allowed_tools:
+                if _CLAUDE_SERVER_GLOB.match(rule):
+                    logger.warning("allowed_tool_server_glob_unsupported", extra={"agent": name.value, "rule": rule})
         if cfg.mode == "acp":
+            if cfg.allowed_tools or cfg.allow_all_tools:
+                logger.warning("allowed_tools_ignored_in_acp_mode", extra={"agent": name.value})
             return AcpAdapter(cfg, self.settings, self.workspace)
+        if cfg.allow_all_tools:
+            logger.warning("allow_all_tools_enabled", extra={"agent": name.value})
         return CliAdapter(cfg, self.settings)
 
     async def start(self) -> None:
@@ -778,6 +849,143 @@ class AgentRegistry:
         info["authenticated"] = _auth_state(auth)
         return info
 
+    async def capabilities(
+        self,
+        agent: AgentName,
+        working_dir: str | None,
+        *,
+        ask_agent: bool | Literal["auto", "never"] = True,
+        model: str | None = None,
+    ) -> dict[str, Any]:
+        """Native, model-free listing of tools and skills, tracked separately in `coverage`.
+
+        Per category: `native` (authoritative, empty is valid), `unavailable` (native listing exists but
+        timed out, failed or was malformed), `unknown` (no verified safe listing was run) or `unsupported`
+        (CLI verified to have no listing). Only `unsupported` categories may use one model turn, and only
+        when ask_agent is True/"auto". False/"never" never calls a model.
+        """
+        if ask_agent is True or ask_agent == "auto":
+            allow_model = True
+        elif ask_agent is False or ask_agent == "never":
+            allow_model = False
+        else:
+            raise InputError("ask_agent must be true, false, 'auto' or 'never'")
+        cfg = self.settings.agent(agent)
+        cwd = self.workspace.resolve_dir(working_dir)
+        if not shutil.which(cfg.bin):
+            raise AgentUnavailableError(f"{agent.value} is not installed ({cfg.bin!r} not on PATH)")
+        start = time.monotonic()
+        report: dict[str, Any] = {"agent": agent.value, "cwd": str(cwd), "mcp_servers": None}
+        notes: list[str] = []
+        report |= await self._list_capabilities(agent, cfg.bin, cwd, notes)
+        missing = sorted(k for k, v in report["coverage"].items() if v == "unsupported")
+        reason = None
+        if missing and allow_model:
+            reason = "cli_lacks_native_listing_for_" + "_and_".join(missing)
+        elif missing:
+            notes.append("self-report skipped because ask_agent is false")
+        if reason is not None:
+            report["self_report_reason"] = reason
+            report["self_report"] = await self._self_report(agent, cwd, model)
+        report["notes"] = notes
+        logger.info(
+            "capabilities",
+            extra={
+                "agent": agent.value,
+                "cwd": str(cwd),
+                "duration_ms": int((time.monotonic() - start) * 1000),
+                "mcp_servers": len(report["mcp_servers"] or []),
+                "skills": len(report["skills"] or []),
+                "self_report": reason is not None,
+            },
+        )
+        return report
+
+    async def _self_report(self, agent: AgentName, cwd: Path, model: str | None) -> dict[str, Any]:
+        """Ask the agent itself (one model turn) to describe its tools, skills and capabilities."""
+        try:
+            result = await self.invoke(agent, self.settings.capabilities_prompt, str(cwd), model)
+        except (InputError, WorkspaceError, AgentUnavailableError):
+            return {"ok": False, "error": "self-report could not start"}
+        parsed = _parse_json_object(result.output) if result.ok else None
+        return {
+            "ok": result.ok,
+            "session_id": result.session_id,
+            "exit_code": result.exit_code,
+            "timed_out": result.timed_out,
+            "duration_ms": result.duration_ms,
+            "report": parsed,
+            # Model text is returned only on success. On failure it may be an error dump.
+            "output": result.output if result.ok and parsed is None else None,
+        }
+
+    async def _list_capabilities(self, agent: AgentName, binary: str, cwd: Path, notes: list[str]) -> dict[str, Any]:
+        """Tools and skills read from the CLI's own metadata commands. Never starts a model turn."""
+        report: dict[str, Any] = {"builtin_tools": None, "skills": None}
+        coverage = {"tools": "unsupported", "skills": "unsupported"}
+
+        async def probe(template: str, parse: Any) -> Any:
+            """Parsed value, or None for any timeout, error, or malformed output (details stay unlogged)."""
+            outcome = await self._run_capability_probe(binary, template, cwd)
+            if outcome is None or outcome.exit_code != 0 or outcome.timed_out or not outcome.stdout:
+                return None
+            return parse(outcome.stdout)
+
+        async with self.semaphores[agent]:
+            if agent is AgentName.CLAUDE:
+                coverage = {"tools": "unknown", "skills": "unknown"}
+                template = self.settings.claude_capabilities_args
+                parsed = await probe(template, parse_claude_init) if template.strip() else None
+                if not template.strip():
+                    notes.append("claude has no verified metadata-only tool/skill listing; none was run")
+                elif parsed is None:
+                    coverage = {"tools": "unavailable", "skills": "unavailable"}
+                    notes.append("claude native listing failed or was malformed")
+                else:
+                    report |= {k: v for k, v in parsed.items() if k not in ("builtin_tools", "skills")}
+                    report["builtin_tools"] = parsed["builtin_tools"]
+                    report["skills"] = parsed["skills"]
+                    coverage["tools"] = "native" if parsed["builtin_tools"] is not None else "unavailable"
+                    coverage["skills"] = "native" if parsed["skills"] is not None else "unavailable"
+                    if any(s.get("status") == "pending" for s in parsed["mcp_servers"]):
+                        notes.append("Servers with status 'pending' were still connecting, so their tools are missing")
+            elif agent is AgentName.COPILOT:
+                servers, skills = await asyncio.gather(
+                    probe(self.settings.copilot_mcp_list_args, parse_copilot_mcp_list),
+                    probe(self.settings.copilot_skill_list_args, parse_copilot_skill_list),
+                )
+                report["mcp_servers"] = servers
+                report["skills"] = skills
+                coverage["skills"] = "native" if skills is not None else "unavailable"
+                notes.append("copilot has no model-free listing of built-in tool names")
+            elif agent is AgentName.CODEX:
+                report["mcp_servers"] = await probe(self.settings.codex_mcp_list_args, parse_codex_mcp_list)
+                notes.append("codex has no model-free listing of tool or skill names")
+            else:
+                skills = await probe(self.settings.opencode_skill_list_args, parse_opencode_skill_list)
+                report["skills"] = skills
+                coverage["skills"] = "native" if skills is not None else "unavailable"
+                notes.append("opencode has no model-free listing of built-in tool names")
+        for category, state in coverage.items():
+            if state == "unavailable":
+                notes.append(f"native {category} listing unavailable")
+        report["coverage"] = coverage
+        return report
+
+    async def _run_capability_probe(self, binary: str, template: str, cwd: Path) -> ProcessOutcome | None:
+        if not template.strip():
+            return None
+        args, _ = render_args(template, cwd=cwd)
+        try:
+            return await run_process(
+                [binary, *args],
+                cwd,
+                timeout_seconds=_CAPABILITIES_TIMEOUT_SECONDS,
+                max_output_bytes=_CAPABILITIES_MAX_OUTPUT_BYTES,
+            )
+        except AgentUnavailableError:
+            return None
+
     async def _run_check(self, binary: str, template: str, max_output_bytes: int = 64 * 1024) -> ProcessOutcome | None:
         if not template.strip() or not shutil.which(binary):
             return None
@@ -791,6 +999,18 @@ class AgentRegistry:
             )
         except AgentUnavailableError:
             return None
+
+
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    """The outermost {...} in an answer, tolerating code fences or prose around it."""
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start : end + 1])
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _auth_state(outcome: ProcessOutcome | None) -> bool | None:

@@ -52,6 +52,18 @@ def test_settings_parse_csv_env_and_require_key(monkeypatch: pytest.MonkeyPatch,
         Settings(_env_file=None)
 
 
+def test_allowed_tools_parse_and_validate(monkeypatch: pytest.MonkeyPatch, make_settings):
+    monkeypatch.setenv("GATEWAY_API_KEY", "k")
+    monkeypatch.setenv("COPILOT_ALLOWED_TOOLS", "slack(slack_read_channel), glean-adobe")
+    assert Settings(_env_file=None).copilot_allowed_tools == ["slack(slack_read_channel)", "glean-adobe"]
+    with pytest.raises(ValidationError, match="Invalid tool rule"):
+        make_settings(claude_allowed_tools=["--dangerously-skip-permissions"])
+    with pytest.raises(ValidationError, match="CODEX_ALLOWED_TOOLS_ARGS"):
+        make_settings(codex_allowed_tools=["x"])
+    with pytest.raises(ValidationError, match="OPENCODE_ALLOW_ALL_TOOLS_ARGS"):
+        make_settings(opencode_allow_all_tools=True)
+
+
 @pytest.mark.parametrize("model", ["--dangerously-skip-permissions", "a b", "x;rm", "-m"])
 def test_validate_model_rejects_flag_like_values(model: str):
     with pytest.raises(InputError):

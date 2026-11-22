@@ -31,7 +31,9 @@ Run all three before you finish. Add dependencies with `uv add`, then regenerate
 - Never use `shell=True` or string commands. Templates are `shlex.split` first, then placeholders are
   substituted per token in one regex pass (`render_args`). Keep it that way so prompts can't inject flags.
 - Every caller-supplied path (`working_dir`, proxied `file_path`, ACP permission locations) goes through
-  `Workspace`. New tools that accept paths must do the same.
+  `Workspace`. New tools that accept paths must do the same. The only exceptions are ACP permission
+  locations: they may also match `ACP_PERMISSION_EXTRA_PATHS`, and with `INTERACTIVE_APPROVE_OUTSIDE_PATHS`
+  an interactive turn shows other paths to the human with a warning. Never auto-allow outside paths.
 - New authenticated routes must live under a prefix in `PROTECTED_PREFIXES`. Keep `BearerAuthMiddleware`
   pure ASGI. `BaseHTTPMiddleware` buffers responses and breaks SSE.
 - Spawn children only through `spawn()` / `run_process()`. They scrub `GATEWAY_API_KEY`, start a new
@@ -43,13 +45,15 @@ Run all three before you finish. Add dependencies with `uv add`, then regenerate
   to pick the directory. Session ids go through `validate_session_id` before they reach argv.
 - Session titles can contain prompt text. Return them to callers but never log them.
 - Shell-capable proxied tools (`Bash`) stay out of the `CLAUDE_PROXY_TOOLS` default. Path checks can't sandbox them.
+- `<agent>_allow_all_tools` defaults stay `False`. Enabling one is an operator decision in `.env`, never a code default.
 
 ## Adding an agent
 
 1. Add a member to `AgentName` in `gateway/config.py`.
 2. Add `Settings` fields named exactly `<agent>_bin`, `_mode`, `_args`, `_resume_args`, `_new_session_args`,
-   `_output_format`, `_model_args`, `_default_model`, `_acp_args`, `_version_args`, `_auth_check_args`. `Settings.agent()` looks them up with `getattr`,
-   so a typo fails at runtime. Include `<agent>_default_model` in the empty-to-None validator.
+   `_output_format`, `_model_args`, `_default_model`, `_allowed_tools`, `_allowed_tools_args`, `_allow_all_tools`, `_allow_all_tools_args`, `_acp_args`, `_version_args`, `_auth_check_args`. `Settings.agent()` looks them up with `getattr`,
+   so a typo fails at runtime. Include `<agent>_default_model` in the empty-to-None validator and
+   `<agent>_allowed_tools` in the CSV and tool-rule validators.
 3. Add a label in `_AGENT_LABELS` (`gateway/server.py`). Routes, tools and discovery iterate over
    `AgentName` and pick the agent up automatically.
 4. Implement a `SessionStore` in `gateway/sessions.py` that reads the CLI's native session storage and

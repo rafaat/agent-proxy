@@ -25,7 +25,10 @@ _STREAM_LIMIT = 16 * 1024 * 1024
 _METHOD_NOT_FOUND = -32601
 _MAX_TRACKED_TOOLS = 128
 
-PermissionApproval = Callable[[str, str, tuple[Path, ...]], Awaitable[bool]]
+# (session_id, title, paths, paths_outside_allowed_roots) -> approved
+PermissionApproval = Callable[[str, str, tuple[Path, ...], tuple[Path, ...]], Awaitable[bool]]
+# Resolves a reported location to (resolved path, inside allowed roots). Raises WorkspaceError if unusable.
+PermissionPathResolver = Callable[[str], tuple[Path, bool]]
 
 
 class AcpError(RuntimeError):
@@ -50,11 +53,13 @@ class AcpStdioClient:
         process: asyncio.subprocess.Process,
         *,
         permission_policy: PermissionPolicy,
-        resolve_path: Callable[[str], Path],
+        resolve_path: PermissionPathResolver,
         max_output_bytes: int,
         approve_permission: PermissionApproval | None = None,
+        prompt_outside_paths: bool = False,
     ):
         self._proc = process
+        self._prompt_outside_paths = prompt_outside_paths
         self._policy = permission_policy
         self._resolve_path = resolve_path
         self._approve_permission = approve_permission
@@ -237,26 +242,32 @@ class AcpStdioClient:
         if self._approve_permission:
             call = self._tool_calls.get(call.get("toolCallId"), {}) | call
         locations = call.get("locations") or []
-        paths = []
-        valid_paths = True
+        paths: list[Path] = []
+        outside: list[Path] = []
+        parsed = True
         try:
             for loc in locations:
                 if not isinstance(loc, dict) or not isinstance(loc.get("path"), str) or not loc["path"]:
                     raise WorkspaceError("Invalid permission location")
-                paths.append(self._resolve_path(loc["path"]))
+                path, inside = self._resolve_path(loc["path"])
+                paths.append(path)
+                if not inside:
+                    outside.append(path)
         except (WorkspaceError, OSError, RuntimeError):
-            valid_paths = False
+            parsed = False
+        valid_paths = parsed and not outside
         title = call.get("title")
         if self._approve_permission:
+            # With the flag on, a human decides on paths outside the allowed roots (shown with a warning).
             one_time_option = any(opt.get("kind") == "allow_once" for opt in options)
             allow = (
-                valid_paths
+                (valid_paths or (parsed and self._prompt_outside_paths))
                 and one_time_option
                 and self.session_id is not None
                 and params.get("sessionId") == self.session_id
                 and isinstance(title, str)
                 and bool(title.strip())
-                and await self._approve_permission(self.session_id, title, tuple(paths))
+                and await self._approve_permission(self.session_id, title, tuple(paths), tuple(outside))
             )
             preferred = ("allow_once",) if allow else ("reject_once",)
         else:
@@ -267,7 +278,7 @@ class AcpStdioClient:
                 if option.get("kind") == kind:
                     logger.info(
                         "acp_permission",
-                        extra={"decision": kind, "valid_paths": valid_paths},
+                        extra={"decision": kind, "valid_paths": valid_paths, "outside_paths": len(outside)},
                     )
                     return {
                         "outcome": {

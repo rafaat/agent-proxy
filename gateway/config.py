@@ -61,6 +61,10 @@ class AgentConfig:
     output_format: OutputFormat
     model_args: str
     default_model: str | None
+    allowed_tools: tuple[str, ...]
+    allowed_tools_args: str
+    allow_all_tools: bool
+    allow_all_tools_args: str
     acp_args: str
     version_args: str
     auth_check_args: str
@@ -141,6 +145,30 @@ class Settings(BaseSettings):
     opencode_default_model: str | None = None
     codex_default_model: str | None = None
 
+    # Tool permission rules, passed to the CLI verbatim (wildcards are the CLI's own syntax).
+    # *_ALLOWED_TOOLS_ARGS is rendered once per rule with {tool} and appended in CLI mode.
+    claude_allowed_tools: CsvList = Field(default_factory=list)
+    copilot_allowed_tools: CsvList = Field(default_factory=list)
+    opencode_allowed_tools: CsvList = Field(default_factory=list)
+    codex_allowed_tools: CsvList = Field(default_factory=list)
+
+    claude_allowed_tools_args: str = "--allowedTools={tool}"
+    copilot_allowed_tools_args: str = "--allow-tool={tool}"
+    opencode_allowed_tools_args: str = ""
+    codex_allowed_tools_args: str = ""
+
+    # <AGENT>_ALLOW_ALL_TOOLS=true appends *_ALLOW_ALL_TOOLS_ARGS in CLI mode: every tool, shell
+    # included, runs without approval. Remote callers with the API key get that power on this host.
+    claude_allow_all_tools: bool = False
+    copilot_allow_all_tools: bool = False
+    opencode_allow_all_tools: bool = False
+    codex_allow_all_tools: bool = False
+
+    claude_allow_all_tools_args: str = "--dangerously-skip-permissions"
+    copilot_allow_all_tools_args: str = "--allow-all-tools"
+    opencode_allow_all_tools_args: str = ""
+    codex_allow_all_tools_args: str = ""
+
     claude_acp_args: str = ""
     copilot_acp_args: str = "--acp"
     opencode_acp_args: str = "acp --cwd {cwd}"
@@ -161,6 +189,14 @@ class Settings(BaseSettings):
     codex_auth_check_args: str = "login status"
 
     acp_permission_policy: PermissionPolicy = "allow"
+    # How long an interactive turn waits for a human approval. The run timeout pauses meanwhile.
+    interactive_approval_timeout_seconds: float = Field(default=900, gt=0)
+    # Interactive turns ask the human about paths outside ALLOWED_WORKSPACES and ACP_PERMISSION_EXTRA_PATHS
+    # (with a warning) instead of rejecting them outright.
+    interactive_approve_outside_paths: bool = False
+    # Extra directories ACP permission requests may touch besides ALLOWED_WORKSPACES (e.g. ~/.claude).
+    # They never widen working_dir or session cwd checks.
+    acp_permission_extra_paths: CsvList = Field(default_factory=list)
 
     # Native session stores, used by list_sessions and to validate resumed sessions.
     claude_projects_dir: str = "~/.claude/projects"
@@ -168,6 +204,24 @@ class Settings(BaseSettings):
     codex_sessions_dir: str = "~/.codex/sessions"
     codex_session_index: str = "~/.codex/session_index.jsonl"
     opencode_session_list_args: str = "session list --format json -n 1000"
+
+    # list_agent_capabilities probes. They must not start a model turn.
+    # Claude has no documented metadata-only listing (`claude mcp list` health-checks connectors and
+    # `-p /cost` relies on undocumented behavior and can start connectors), so discovery is off by default.
+    # Operators who verified a safe command can set it; its stream-json init event is parsed.
+    claude_capabilities_args: str = ""
+    copilot_mcp_list_args: str = "mcp list --json"
+    copilot_skill_list_args: str = "skill list --json"
+    codex_mcp_list_args: str = "mcp list --json"
+    opencode_skill_list_args: str = "debug skill"
+    # Sent when list_agent_capabilities requests a self-report (one billable model turn).
+    capabilities_prompt: str = (
+        "Describe your own capabilities in this environment. Do not call any tools, do not read or change "
+        "files, and do not contact any service; answer from what you already know about your configuration. "
+        "Reply with only a JSON object with these keys: summary (string), builtin_tools (array of tool names), "
+        "mcp_servers (array of objects with name and tools, an array of tool names), skills (array of objects "
+        "with name and description), other_capabilities (array of strings), limitations (array of strings)."
+    )
 
     # Claude `mcp serve` proxy
     claude_mcp_proxy_enabled: bool = True
@@ -190,11 +244,29 @@ class Settings(BaseSettings):
         "allowed_origins",
         "allowed_workspaces",
         "claude_proxy_tools",
+        "claude_allowed_tools",
+        "copilot_allowed_tools",
+        "opencode_allowed_tools",
+        "codex_allowed_tools",
+        "acp_permission_extra_paths",
         mode="before",
     )
     @classmethod
     def _split(cls, value: object) -> object:
         return _split_csv(value)
+
+    @field_validator(
+        "claude_allowed_tools",
+        "copilot_allowed_tools",
+        "opencode_allowed_tools",
+        "codex_allowed_tools",
+    )
+    @classmethod
+    def _check_tool_rules(cls, value: list[str]) -> list[str]:
+        for rule in value:
+            if rule.startswith("-") or "\x00" in rule:
+                raise ValueError(f"Invalid tool rule: {rule!r}")
+        return value
 
     @field_validator(
         "claude_default_model",
@@ -211,6 +283,17 @@ class Settings(BaseSettings):
     def _check_auth(self) -> Settings:
         if not self.gateway_api_key.get_secret_value() and not self.allow_no_auth:
             raise ValueError("GATEWAY_API_KEY is required (set ALLOW_NO_AUTH=true only for local development)")
+        for name in AgentName:
+            template = getattr(self, f"{name.value}_allowed_tools_args")
+            if getattr(self, f"{name.value}_allowed_tools") and "{tool}" not in template:
+                key = name.value.upper()
+                raise ValueError(f"{key}_ALLOWED_TOOLS needs {key}_ALLOWED_TOOLS_ARGS with a {{tool}} placeholder")
+            if (
+                getattr(self, f"{name.value}_allow_all_tools")
+                and not getattr(self, f"{name.value}_allow_all_tools_args").strip()
+            ):
+                key = name.value.upper()
+                raise ValueError(f"{key}_ALLOW_ALL_TOOLS needs {key}_ALLOW_ALL_TOOLS_ARGS")
         return self
 
     def workspace_roots(self) -> list[Path]:
@@ -224,6 +307,11 @@ class Settings(BaseSettings):
             roots.append(path)
         return roots
 
+    def acp_permission_roots(self) -> list[Path]:
+        """Resolved extra ACP permission roots. Missing directories are skipped."""
+        roots = (Path(item).expanduser().resolve() for item in self.acp_permission_extra_paths)
+        return [path for path in roots if path.is_dir()]
+
     def agent(self, name: AgentName) -> AgentConfig:
         prefix = name.value
         return AgentConfig(
@@ -236,6 +324,10 @@ class Settings(BaseSettings):
             output_format=getattr(self, f"{prefix}_output_format"),
             model_args=getattr(self, f"{prefix}_model_args"),
             default_model=getattr(self, f"{prefix}_default_model"),
+            allowed_tools=tuple(getattr(self, f"{prefix}_allowed_tools")),
+            allowed_tools_args=getattr(self, f"{prefix}_allowed_tools_args"),
+            allow_all_tools=getattr(self, f"{prefix}_allow_all_tools"),
+            allow_all_tools_args=getattr(self, f"{prefix}_allow_all_tools_args"),
             acp_args=getattr(self, f"{prefix}_acp_args"),
             version_args=getattr(self, f"{prefix}_version_args"),
             auth_check_args=getattr(self, f"{prefix}_auth_check_args"),

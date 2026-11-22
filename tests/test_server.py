@@ -13,7 +13,6 @@ from mcp.client.session import ClientSession
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 
-from gateway import server as gateway_server
 from gateway.server import create_app
 from tests.conftest import free_port
 
@@ -37,9 +36,17 @@ def gateway(
 
 
 @pytest.fixture
-async def live_url(make_settings, fake_bins) -> AsyncIterator[str]:
+def live_overrides() -> dict[str, object]:
+    return {}
+
+
+@pytest.fixture
+async def live_url(make_settings, fake_bins, live_overrides: dict[str, object]) -> AsyncIterator[str]:
     port = free_port()
-    app = create_app(make_settings(claude_mcp_proxy_enabled=True, claude_interactive_bin=str(fake_bins["acp"])))
+    settings = make_settings(
+        claude_mcp_proxy_enabled=True, claude_interactive_bin=str(fake_bins["acp"]), **live_overrides
+    )
+    app = create_app(settings)
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_config=None, lifespan="on"))
     task = asyncio.create_task(server.serve())
     for _ in range(200):
@@ -111,7 +118,8 @@ async def test_mcp_streamable_http_end_to_end(live_url: str, workspace: Path, ca
         ClientSession(read, write) as session,
     ):
         await session.initialize()
-        names = {t.name for t in (await session.list_tools()).tools}
+        tools = (await session.list_tools()).tools
+        names = {t.name for t in tools}
         # Bash is not in CLAUDE_PROXY_TOOLS, so it must not be re-exported.
         assert names == {
             "ask_claude",
@@ -124,8 +132,21 @@ async def test_mcp_streamable_http_end_to_end(live_url: str, workspace: Path, ca
             "ask_codex_interactive",
             "list_available_agents",
             "list_sessions",
+            "list_agent_capabilities",
             "claude_Read",
         }
+        capabilities_tool = next(t for t in tools if t.name == "list_agent_capabilities")
+        ask_agent_schema = capabilities_tool.input_schema["properties"]["ask_agent"]
+        assert ask_agent_schema["default"] is True
+        assert "always" not in json.dumps(ask_agent_schema)
+        capabilities = await session.call_tool("list_agent_capabilities", {"agent": "claude"})
+        assert not capabilities.is_error
+        assert "self_report" not in json.loads(capabilities.content[0].text)
+        legacy_false = await session.call_tool("list_agent_capabilities", {"agent": "codex", "ask_agent": False})
+        assert not legacy_false.is_error
+        assert "self_report" not in json.loads(legacy_false.content[0].text)
+        invalid_mode = await session.call_tool("list_agent_capabilities", {"agent": "claude", "ask_agent": "always"})
+        assert invalid_mode.is_error
 
         ok = await session.call_tool("ask_opencode", {"prompt": "hi", "working_dir": "sub"})
         assert not ok.is_error
@@ -151,6 +172,9 @@ async def test_mcp_streamable_http_end_to_end(live_url: str, workspace: Path, ca
 
     requests = [record for record in caplog.records if record.msg == "mcp_tool_request"]
     assert [record.tool for record in requests] == [
+        "list_agent_capabilities",
+        "list_agent_capabilities",
+        "list_agent_capabilities",
         "ask_opencode",
         "ask_claude",
         "list_sessions",
@@ -162,11 +186,14 @@ async def test_mcp_streamable_http_end_to_end(live_url: str, workspace: Path, ca
     assert all(not record.args and not hasattr(record, "arguments") for record in requests)
 
 
-async def test_interactive_permission_round_trip(live_url: str, workspace: Path):
+@pytest.mark.parametrize(
+    ("live_overrides", "outside_decision"),
+    [({}, "no"), ({"interactive_approve_outside_paths": True}, "yes")],
+)
+async def test_interactive_permission_round_trip(live_url: str, workspace: Path, outside_decision: str):
     messages = []
-    decisions = iter(
-        [types.ElicitResult(action="accept", content={"approve": True}), types.ElicitResult(action="decline")]
-    )
+    approve = types.ElicitResult(action="accept", content={"approve": True})
+    decisions = iter([approve, types.ElicitResult(action="decline"), approve])
 
     async def elicit(_context, params: types.ElicitRequestParams) -> types.ElicitResult:
         messages.append(params.message)
@@ -178,15 +205,18 @@ async def test_interactive_permission_round_trip(live_url: str, workspace: Path)
         ClientSession(read, write, elicitation_callback=elicit) as session,
     ):
         await session.initialize()
-        for path, expected in (("example.txt", "yes"), ("example.txt", "no"), ("../../outside.txt", "no")):
+        cases = (("example.txt", "yes"), ("example.txt", "no"), ("../../outside.txt", outside_decision))
+        for path, expected in cases:
             result = await session.call_tool("ask_claude_interactive", {"prompt": f"PERM|{path}", "working_dir": "sub"})
             assert not result.is_error
             assert result.structured_content["output"] == f"perm={expected}"
-        assert (
-            messages
-            == [f"claude requests permission: Edit example file\nReported paths:\n{workspace / 'sub' / 'example.txt'}"]
-            * 2
-        )
+        inside = f"claude requests permission: Edit example file\nReported paths:\n{workspace / 'sub' / 'example.txt'}"
+        assert messages[:2] == [inside] * 2
+        if outside_decision == "no":
+            assert len(messages) == 2
+        else:
+            outside = workspace.parent / "outside.txt"
+            assert messages[2].endswith(f"{outside}\nWARNING: outside the allowed workspaces:\n{outside}")
 
 
 async def test_interactive_followup_resumes_same_turn(live_url: str, workspace: Path):
@@ -223,8 +253,8 @@ async def test_interactive_followup_resumes_same_turn(live_url: str, workspace: 
         assert finished.structured_content["output"] == "perm=yes perm=no"
 
 
-async def test_interactive_followup_expires(live_url: str, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(gateway_server, "_APPROVAL_TIMEOUT_SECONDS", 0.2)
+@pytest.mark.parametrize("live_overrides", [{"interactive_approval_timeout_seconds": 0.2}])
+async def test_interactive_followup_expires(live_url: str):
     async with (
         httpx2.AsyncClient(headers=AUTH, timeout=30) as http,
         streamable_http_client(f"{live_url}/mcp", http_client=http) as (read, write),
@@ -243,8 +273,8 @@ async def test_interactive_followup_expires(live_url: str, monkeypatch: pytest.M
         assert "expired" in expired.content[0].text
 
 
-async def test_interactive_permission_timeout_denies(live_url: str, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setattr(gateway_server, "_APPROVAL_TIMEOUT_SECONDS", 0.2)
+@pytest.mark.parametrize("live_overrides", [{"interactive_approval_timeout_seconds": 0.2}])
+async def test_interactive_permission_timeout_denies(live_url: str):
     shown = asyncio.Event()
 
     async def elicit(_context, _params: types.ElicitRequestParams) -> types.ElicitResult:
@@ -264,6 +294,25 @@ async def test_interactive_permission_timeout_denies(live_url: str, monkeypatch:
         assert result.structured_content["output"] == "perm=no"
 
 
+@pytest.mark.parametrize(
+    "live_overrides", [{"subprocess_timeout_seconds": 0.5, "interactive_approval_timeout_seconds": 5}]
+)
+async def test_pending_approval_pauses_run_timeout(live_url: str):
+    async def elicit(_context, _params: types.ElicitRequestParams) -> types.ElicitResult:
+        await asyncio.sleep(1.0)
+        return types.ElicitResult(action="accept", content={"approve": True})
+
+    async with (
+        httpx2.AsyncClient(headers=AUTH, timeout=30) as http,
+        streamable_http_client(f"{live_url}/mcp", http_client=http) as (read, write),
+        ClientSession(read, write, elicitation_callback=elicit) as session,
+    ):
+        await session.initialize()
+        result = await session.call_tool("ask_claude_interactive", {"prompt": "PERM|example.txt"})
+        assert not result.is_error, result.content
+        assert result.structured_content["output"] == "perm=yes"
+
+
 async def test_per_agent_mount_and_authenticated_sse(live_url: str):
     async with (
         httpx2.AsyncClient(headers=AUTH, timeout=30) as http,
@@ -278,9 +327,18 @@ async def test_per_agent_mount_and_authenticated_sse(live_url: str):
             "ask_copilot",
             "ask_copilot_interactive",
             "list_sessions",
+            "list_agent_capabilities",
         ]
         listed = await session.call_tool("list_sessions", {})
         assert [s["id"] for s in json.loads(listed.content[0].text)["sessions"]] == ["p-in"]
+        capabilities = await session.call_tool("list_agent_capabilities", {})
+        assert not capabilities.is_error
+        report = json.loads(capabilities.content[0].text)
+        assert report["self_report"]["ok"]
+        assert report["self_report_reason"] == "cli_lacks_native_listing_for_tools"
+        listing_only = await session.call_tool("list_agent_capabilities", {"ask_agent": False})
+        assert not listing_only.is_error
+        assert "self_report" not in json.loads(listing_only.content[0].text)
 
     async with (
         sse_client(f"{live_url}/agents/claude/sse", headers=AUTH) as (read, write),
@@ -288,6 +346,12 @@ async def test_per_agent_mount_and_authenticated_sse(live_url: str):
     ):
         await session.initialize()
         names = {t.name for t in (await session.list_tools()).tools}
-        assert names == {"ask_claude", "ask_claude_interactive", "list_sessions", "claude_Read"}
+        assert names == {
+            "ask_claude",
+            "ask_claude_interactive",
+            "list_sessions",
+            "list_agent_capabilities",
+            "claude_Read",
+        }
         result = await session.call_tool("ask_claude", {"prompt": "over sse"})
         assert json.loads(result.content[0].text)["stdin"] == "over sse"
